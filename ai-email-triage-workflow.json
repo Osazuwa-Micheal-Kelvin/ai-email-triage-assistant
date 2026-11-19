@@ -1,0 +1,899 @@
+{
+  "name": "AI Email Triage (Gemini + Gmail + Slack) - Important Only + 3h Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-review-1",
+              "leftValue": "={{ $json.needs_review }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f5414f6f-fd20-4a17-8dae-b96304fdee00",
+      "name": "IF Needs Review (Important)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3312,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 3
+            }
+          ]
+        }
+      },
+      "id": "5702ce5d-72de-4468-9875-b9c47703d8a6",
+      "name": "Every 3 Hours - Digest Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1088,
+        1376
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "limit": 100,
+        "simple": false,
+        "filters": {
+          "includeSpamTrash": true,
+          "q": "=after:{{ Math.floor($now.startOf('day').toSeconds()) }} -in:trash -in:sent -in:drafts"
+        },
+        "options": {}
+      },
+      "id": "e90455b6-a17b-48b9-b937-e6b3f1352488",
+      "name": "Gmail - Get Today's Emails",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1312,
+        1376
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const RULES_TEXT = \"Rules for deciding importance (judge by the BODY; sender, subject and headers are only weak hints):\\nNOT important: promotions, discounts, ads, product recommendations, reward or gift blasts, newsletters; order confirmations, receipts and payment confirmations for an order the person just placed; order processing or shipped-with-tracking updates; automated no-reply notices with nothing to act on, auto-replies, out-of-office; job-board alerts and job recommendations; verification codes. Category Newsletter for these (Spam for unsolicited junk or scams).\\nIMPORTANT: (a) bank or fintech emails about the person's money: debit alerts, credit alerts, transfers, failed or declined payments, statements, card or account security alerts (a bank's promotional offer is NOT important); (b) delivery news that needs attention: order arrived or delivered, out for delivery today, delivery failed, pickup required, a problem with an order or refund; (c) a real message about a job application, interview, job offer or a recruiter writing to the person (NOT an automated job alert); (d) invoices, tax, legal, government, contracts, medical, deadlines; (e) a real person writing personally with content that matters. Never important for Spam or Newsletter.\";\nconst MAX = 100;\nconst all = items.map(i => i.json).filter(m => m && (m.id || m.subject || m.Subject));\nif (all.length === 0) return [{ json: { empty: true, total: 0, systemPrompt: '', userPrompt: '' } }];\n\nconst INVIS = /[\\u00AD\\u034F\\u061C\\u115F\\u1160\\u17B4\\u17B5\\u180E\\u2000-\\u200F\\u2028-\\u202F\\u205F-\\u206F\\u3000\\uFEFF]/g;\nfunction stripHtml(h) {\n  return String(h).replace(/<style[\\s\\S]*?<\\/style>/gi, ' ').replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#?\\w+;/g, ' ');\n}\nfunction tidy(t) {\n  return String(t || '').replace(/https?:\\/\\/\\S+/g, ' ').replace(INVIS, ' ').replace(/[-=_*]{4,}/g, ' ').replace(/\\s+/g, ' ').trim();\n}\nfunction bodyOf(m) {\n  const a = tidy(m.text);\n  if (a.length >= 30) return a.slice(0, 1200);\n  const b = tidy(stripHtml(m.html || ''));\n  if (b.length >= 30) return b.slice(0, 1200);\n  return tidy(m.snippet).slice(0, 1200) || '(empty body)';\n}\nfunction senderOf(m) {\n  const f = m.from || m.From;\n  if (f && typeof f === 'object') {\n    return f.text || (f.value && f.value[0] && ((f.value[0].name ? f.value[0].name + ' ' : '') + '<' + f.value[0].address + '>')) || 'unknown';\n  }\n  return f || 'unknown';\n}\nconst rows = all.slice(0, MAX).map((m, idx) => ({\n  i: idx,\n  from: String(senderOf(m)).slice(0, 90),\n  subject: String(m.subject || m.Subject || '(no subject)').slice(0, 120),\n  in_spam_folder: Array.isArray(m.labelIds) && m.labelIds.includes('SPAM'),\n  unsubscribe_header: !!(m.headers && m.headers['list-unsubscribe']),\n  body: bodyOf(m)\n}));\nconst meta = rows.map(r => ({ i: r.i, from: r.from, subject: r.subject, in_spam_folder: r.in_spam_folder }));\n\nconst system = `You are an email sorting, notification and analysis assistant for one person's inbox. You never write replies. You are given every email received today, from BOTH the Inbox and the Spam folder. Read each email's body together with its sender and subject, and return ONLY valid JSON, no markdown.\n\n__RULES__\n\nin_spam_folder only says where Gmail put the email. Gmail sometimes puts genuinely important mail in Spam, so judge the content, not the folder.\n\nFor EVERY email index return: category (Sales|Support|Billing|Technical|Internal|Partnership|Spam|Newsletter|Other), priority (Low|Medium|High|Urgent), is_important (boolean), confidence (integer 0-100), summary (max 20 words saying what the email actually is, e.g. \"Temu promotion: free gifts offer\"), action_needed (short sentence, or \"None\").\nAlso return analysis: 3-5 sentences on the day's inbox: themes, risks, what the person should look at first.\nReturn exactly: {\"results\":[{\"i\":0,\"category\":\"\",\"priority\":\"\",\"is_important\":false,\"confidence\":0,\"summary\":\"\",\"action_needed\":\"\"}],\"analysis\":\"\"}`.replace('__RULES__', RULES_TEXT);\n\nconst userPrompt = 'Emails received today:\\n' + JSON.stringify(rows);\nreturn [{ json: { empty: false, total: all.length, analyzed: rows.length, truncated: all.length >= MAX, meta, systemPrompt: system, userPrompt } }];"
+      },
+      "id": "23ee1754-fbec-4a61-b7da-f7c02b4be3ae",
+      "name": "Build Digest Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1536,
+        1376
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-digest-empty",
+              "leftValue": "={{ $json.empty }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "false"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "39579ac6-37ac-4445-9a13-20a9a746757c",
+      "name": "IF Has Emails Today",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        1376
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prep = $('Build Digest Prompt').item.json;\nconst meta = prep.meta;\nlet parsed, err = null;\ntry {\n  const r = items[0].json;\n  if (r.error) throw new Error(String(typeof r.error === 'string' ? r.error : (r.error.message || JSON.stringify(r.error))).replace(/\\s+/g, ' ').slice(0, 160));\n  const txt = r.output;\n  const m = txt.match(/\\{[\\s\\S]*\\}/);\n  parsed = JSON.parse(m ? m[0] : txt);\n} catch (e) { err = e.message; parsed = { results: [], analysis: '' }; }\n\nconst esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst cut = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '...' : s; };\nconst results = Array.isArray(parsed.results) ? parsed.results : [];\nif (err || results.length === 0) {\n  return [{ json: { text: `:warning: *AI model issue - the 3-hour inbox digest could not be generated*\\nThe Gemini model failed after retries while analysing today's ${prep.total} emails. Nothing was lost: the next digest will analyse the whole day again.\\n*Error:* ${esc(err || 'empty response from the model')}\\n*Please check:* the Gemini credential, model name and API quota/billing in n8n.` } }];\n}\nconst byI = {}; for (const r of results) byI[r.i] = r;\n\nconst rows = meta.map(m => ({ m, r: byI[m.i] || null }));\nconst classified = rows.filter(x => x.r);\nconst important = classified.filter(x => x.r.is_important === true && x.r.category !== 'Spam' && x.r.category !== 'Newsletter');\nconst impSet = new Set(important.map(x => x.m.i));\nconst junk = classified.filter(x => x.r.category === 'Spam');\nconst promo = classified.filter(x => x.r.category === 'Newsletter');\nconst other = classified.filter(x => !impSet.has(x.m.i) && x.r.category !== 'Spam' && x.r.category !== 'Newsletter');\nconst unclassified = rows.length - classified.length;\n\nconst order = { Urgent: 0, High: 1, Medium: 2, Low: 3 };\nimportant.sort((a, b) => (order[a.r.priority] ?? 9) - (order[b.r.priority] ?? 9));\nconst pri = { Urgent: 0, High: 0, Medium: 0, Low: 0 };\nfor (const x of important) if (pri[x.r.priority] !== undefined) pri[x.r.priority]++;\nlet confSum = 0, confN = 0;\nfor (const x of classified) { const c = parseInt(x.r.confidence, 10); if (!isNaN(c)) { confSum += c; confN++; } }\nconst avgConf = confN ? Math.round(confSum / confN) : 0;\nconst spamFolder = meta.filter(m => m.in_spam_folder).length;\nconst impInSpam = important.filter(x => x.m.in_spam_folder);\n\nconst time = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lagos' });\nlet t = `:bar_chart: *Inbox digest - today so far, as of ${time} (WAT)*\\n`;\nt += `*Total emails:* ${prep.total} (Inbox ${prep.total - spamFolder}, Spam folder ${spamFolder})${prep.truncated ? ' - newest ' + prep.analyzed + ' analysed' : ''}\\n`;\nt += `*Important:* ${important.length}  |  *Promotions / newsletters:* ${promo.length}  |  *Spam / junk:* ${junk.length}  |  *Other:* ${other.length}\\n`;\nt += `*Urgency of important emails:* Urgent ${pri.Urgent}, High ${pri.High}, Medium ${pri.Medium}, Low ${pri.Low}\\n`;\nt += `*Confidence:* ${avgConf}% average` + (unclassified ? ` (${unclassified} emails could not be classified)` : '') + `\\n`;\nif (impInSpam.length) t += `:warning: *${impInSpam.length} important email(s) are sitting in your SPAM folder - check them!*\\n`;\nif (err) t += `:warning: AI analysis failed: ${esc(err)}\\n`;\nif (parsed.analysis) t += `\\n*Analysis:* ${esc(parsed.analysis)}\\n`;\n\nfunction section(title, list, max, withAction) {\n  if (!list.length) return '';\n  let s = `\\n*${title} (${list.length})*\\n`;\n  for (const x of list.slice(0, max)) {\n    const loc = x.m.in_spam_folder ? ' :warning: _in Spam folder_' : '';\n    const pr = withAction ? `[${x.r.priority}] ` : '';\n    const act = withAction && x.r.action_needed && !/^none/i.test(x.r.action_needed) ? ` -> ${esc(cut(x.r.action_needed, 100))}` : '';\n    s += `- ${pr}${esc(cut(x.m.from, 50))} - ${esc(cut(x.m.subject, 70))}: ${esc(cut(x.r.summary, 140))}${act}${loc}\\n`;\n  }\n  if (list.length > max) s += `...and ${list.length - max} more\\n`;\n  return s;\n}\nt += section('IMPORTANT - needs you', important, 20, true);\nt += section('Promotions and newsletters', promo, 15, false);\nt += section('Spam / junk', junk, 15, false);\nt += section('Other', other, 15, false);\nreturn [{ json: { text: t.slice(0, 38000) } }];"
+      },
+      "id": "a556495a-5745-462d-b446-8427cb829860",
+      "name": "Format Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2272,
+        1376
+      ]
+    },
+    {
+      "parameters": {
+        "select": "user",
+        "user": {
+          "__rl": true,
+          "value": "YOUR_SLACK_USERNAME",
+          "mode": "username"
+        },
+        "text": "={{ $json.text }}",
+        "otherOptions": {}
+      },
+      "id": "501b47a7-90c5-4292-9d08-e1be0d107e31",
+      "name": "Slack - Inbox Digest",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2432,
+        1376
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3-hour inbox digest (independent of the live workflow)\nRuns every 3 hours (Africa/Lagos). Reads everything received since midnight today from the Inbox AND the Spam folder, with full message bodies. Gemini analyses each email itself (header + body, same importance rules as the live workflow), summarises it, and a single Slack message reports totals, important emails (flagging any hiding in Spam), promotions, spam, urgency, confidence and an analysis. Read-only: no labels, no drafts.",
+        "height": 170,
+        "width": 460
+      },
+      "id": "53632013-6f50-4050-bd24-40752e687dbd",
+      "name": "Digest Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1088,
+        1152
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Sender: {{ $json.sender }}\nSubject: {{ $json.subject }}\nHas Attachments: {{ $json.hasAttachments }}\nList-Unsubscribe header present (weak hint only): {{ $json.hasUnsubscribeHeader }}\nAuto-submitted header (weak hint only): {{ $json.isAutoSubmitted }}\n\nBody:\n{{ $json.cleanedBody }}",
+        "options": {
+          "systemMessage": "You are an email sorting, notification and analysis assistant for one person's personal inbox. You never write replies: the human writes every reply himself. Your job is to read each email and decide whether it is important enough to notify him immediately.\n\nReturn ONLY valid JSON. Never include explanations, Markdown, or extra text before or after the JSON.\n\nSteps:\n1. Read the ENTIRE email. The body content is the main evidence. Sender, subject and headers are only weak hints and must never decide the result on their own. Banks, shops and job sites send both important and unimportant emails, so judge each email by what it actually says.\n2. Work out what the email is really about, what actually happened, and whether the recipient needs to know or do something now.\n3. Write a concise summary (1-2 sentences).\n4. Assign category: one of [Sales, Support, Billing, Technical, Internal, Partnership, Spam, Newsletter, Other]\n5. Assign priority: one of [Low, Medium, High, Urgent]\n6. Estimate confidence as an integer 0-100.\n7. Write action_needed: one short sentence saying what the recipient must do or check (for example: Reply to confirm the interview time; Money was debited - check it was you), or None - informational. Never write a reply or draft.\n8. NOT important (is_important false), judged from the body: promotions, discounts, ads, product recommendations, reward or gift blasts, newsletters; order confirmations, receipts and payment confirmations for an order he just placed; order processing or shipped-with-tracking updates (he already knows about the order); automated no-reply notices with nothing to act on, auto-replies, out-of-office; job-board alerts and job recommendations; verification codes. Use category Newsletter for these (Spam for unsolicited junk or scams).\n9. IMPORTANT (is_important true), judged from the body: (a) bank or fintech emails about his money: debit alerts, credit alerts, transfers, failed or declined payments, statements, card or account security alerts (a bank's promotional offer is NOT important - read the body); (b) delivery news that needs attention: the order has arrived or been delivered, out for delivery today, delivery failed, pickup required, a problem with an order or refund; (c) a real message about a job application, interview, job offer or a recruiter writing to him (NOT an automated job alert); (d) invoices, tax, legal, government, contracts, medical, deadlines; (e) a real person writing personally with content that matters. Never true for Spam or Newsletter.\n10. If confidence is below 80 and the email is not Spam/Newsletter, set needs_review to true and explain the limitation in reasoning.\n11. In reasoning, state what in the BODY made the email important or not.\n\nReturn exactly this JSON shape and nothing else:\n{\n  \"summary\": \"string\",\n  \"category\": \"Sales|Support|Billing|Technical|Internal|Partnership|Spam|Newsletter|Other\",\n  \"priority\": \"Low|Medium|High|Urgent\",\n  \"is_important\": false,\n  \"confidence\": 0,\n  \"action_needed\": \"string\",\n  \"needs_review\": false,\n  \"reasoning\": \"string\"\n}"
+        }
+      },
+      "id": "ab2dfd4d-fc58-40c2-9f76-3630746232c7",
+      "name": "AI Agent - Retry Analyze Email",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        2640,
+        416
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-ai-first",
+              "leftValue": "={{ !$json.output || !!$json.error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "17279561-543f-4409-a26b-9e5a88a02894",
+      "name": "IF AI Failed (1st attempt)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "minutes"
+      },
+      "id": "e465835e-708f-49f7-9aa7-53ab6d91b577",
+      "name": "Wait 2 Min Before Retry",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2416,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-ai-final",
+              "leftValue": "={{ $json.aiFailed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fde672b4-2699-4289-adbb-9af3c45d484e",
+      "name": "IF AI Failed (final)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3088,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One throttled \"AI model issue\" notice instead of one Slack message per email.\nconst sd = $getWorkflowStaticData('global');\nconst COOLDOWN_MS = 60 * 60 * 1000;   // at most one AI-issue alert per hour\nconst now = Date.now();\nconst esc = s => String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\n\nsd.aiFailCount = (sd.aiFailCount || 0) + items.length;\nsd.aiLastError = items[items.length - 1].json.aiError || 'unknown error';\nsd.aiRecent = [...(sd.aiRecent || []), ...items.map(i => `${i.json.sender} - ${i.json.subject}`)].slice(-5);\n\nif (sd.aiLastAlert && now - sd.aiLastAlert < COOLDOWN_MS) return [];   // already reported recently\n\nlet t = `:warning: *AI model issue - emails could not be classified*\\n`;\nt += `The Gemini model failed (after retries) on *${sd.aiFailCount}* new email(s). Nothing was labelled or sent to Slack for them; they were left untouched and the next 3-hour digest will still pick them up.\\n`;\nt += `*Latest error:* ${esc(sd.aiLastError)}\\n`;\nt += `*Latest affected emails:*\\n` + sd.aiRecent.map(x => `- ${esc(x).slice(0, 140)}`).join('\\n') + `\\n`;\nt += `*Please check:* the Gemini credential, model name and API quota/billing in n8n.\\n`;\nt += `_Further AI-issue alerts are limited to one per hour._`;\n\nsd.aiLastAlert = now; sd.aiFailCount = 0; sd.aiRecent = [];\nreturn [{ json: { text: t } }];"
+      },
+      "id": "ae8cf363-f867-464a-af60-0adf25aeea40",
+      "name": "Throttle AI Issue Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3312,
+        976
+      ]
+    },
+    {
+      "parameters": {
+        "select": "user",
+        "user": {
+          "__rl": true,
+          "value": "YOUR_SLACK_USERNAME",
+          "mode": "username"
+        },
+        "text": "={{ $json.text }}",
+        "otherOptions": {}
+      },
+      "id": "84e03251-e9ad-44db-b3dc-49b1372f7d92",
+      "name": "Slack - AI Model Issue Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        3536,
+        976
+      ]
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "includeSpamTrash": true,
+          "q": "is:unread -in:trash"
+        },
+        "options": {}
+      },
+      "id": "6a40165e-7bb5-4264-b193-62eac18d6389",
+      "name": "Gmail Trigger - New Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1088,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = [];\nfor (const item of items) {\n  const msg = item.json;\n  const subject = msg.subject || msg.Subject || '';\n  const from = msg.from || msg.From || '';\n  const body = msg.text || msg.html || msg.snippet || '';\n\n  const errors = [];\n  if (!from) errors.push('missing_sender');\n  if (!subject) errors.push('missing_subject');\n  if (!body || body.trim().length === 0) errors.push('empty_body');\n  if (body && body.length > 200000) errors.push('body_too_large');\n\n  results.push({\n    json: {\n      ...msg,\n      isValid: errors.length === 0,\n      validationErrors: errors\n    }\n  });\n}\nreturn results;"
+      },
+      "id": "982299ae-19db-4c51-a94c-f268b948ec33",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1312,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-valid-1",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d485649b-0788-4f7f-afe3-4ddc28c16a83",
+      "name": "IF Valid Email",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1536,
+        672
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "c27e7ee2-f42c-4545-ad25-2a196e483126",
+      "name": "Skip Invalid Email",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        912
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function stripHtml(html) {\n  if (!html) return '';\n  return html\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction removeSignatureAndDisclaimers(text) {\n  if (!text) return '';\n  const cutPatterns = [\n    /--\\s*\\n[\\s\\S]*$/,\n    /\\nSent from my iPhone[\\s\\S]*$/i,\n    /\\nSent from my Android[\\s\\S]*$/i,\n    /\\nGet Outlook for[\\s\\S]*$/i,\n    /\\nBest regards,[\\s\\S]*$/i,\n    /\\nKind regards,[\\s\\S]*$/i,\n    /\\nThis email and any attachments[\\s\\S]*$/i,\n    /\\nThis message contains confidential information[\\s\\S]*$/i,\n    /\\nDISCLAIMER:[\\s\\S]*$/i,\n    /\\nCONFIDENTIALITY NOTICE[\\s\\S]*$/i\n  ];\n  let cleaned = text;\n  for (const pattern of cutPatterns) {\n    cleaned = cleaned.replace(pattern, '');\n  }\n  return cleaned.trim();\n}\n\nconst results = [];\nfor (const item of items) {\n  const msg = item.json;\n  const rawBody = msg.text || msg.html || msg.snippet || '';\n  const isHtml = !!msg.html && !msg.text;\n  const stripped = isHtml ? stripHtml(rawBody) : rawBody;\n  const cleanedBody = removeSignatureAndDisclaimers(stripped).slice(0, 12000);\n\n  const attachments = msg.attachments || (msg.payload && msg.payload.parts)\n    ? (Array.isArray(msg.attachments) ? msg.attachments.length : 0)\n    : 0;\n\n  results.push({\n    json: {\n      messageId: msg.id || msg.messageId || '',\n      threadId: msg.threadId || '',\n      sender: (msg.from && typeof msg.from === 'object' ? (msg.from.text || (msg.from.value && msg.from.value[0] && ((msg.from.value[0].name ? msg.from.value[0].name + ' ' : '') + '<' + msg.from.value[0].address + '>'))) : (msg.from || msg.From)) || 'unknown@unknown.com',\n      subject: msg.subject || msg.Subject || '(no subject)',\n      cleanedBody: cleanedBody || '(empty body)',\n      hasAttachments: attachments > 0,\n      inSpam: Array.isArray(msg.labelIds) && msg.labelIds.includes('SPAM'),\n      hasUnsubscribeHeader: !!(msg.headers && (msg.headers['list-unsubscribe'] || msg.headers['list-id'])),\n      isAutoSubmitted: !!(msg.headers && msg.headers['auto-submitted'] && !/no/i.test(msg.headers['auto-submitted'])),\n      attachmentCount: attachments\n    }\n  });\n}\nreturn results;"
+      },
+      "id": "52572ede-10a4-40f7-ae8d-25e18319d387",
+      "name": "Clean HTML & Extract Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Replace these placeholder values with the real Gmail Label IDs\n// (Resource: Label, Operation: Get Many on a temporary Gmail node will list them)\nconst labelMap = {\n  \"Sales\": \"YOUR_LABEL_ID_SALES\",\n  \"Support\": \"YOUR_LABEL_ID_SUPPORT\",\n  \"Billing\": \"YOUR_LABEL_ID_BILLING\",\n  \"Technical\": \"YOUR_LABEL_ID_TECHNICAL\",\n  \"Internal\": \"YOUR_LABEL_ID_INTERNAL\",\n  \"Partnership\": \"YOUR_LABEL_ID_PARTNERSHIP\",\n  \"Spam\": \"SPAM\",\n  \"Newsletter\": \"YOUR_LABEL_ID_NEWSLETTER\",\n  \"Other\": \"YOUR_LABEL_ID_OTHER\"\n};\n\nreturn items.map(item => ({\n  json: {\n    ...item.json,\n    gmailLabelId: labelMap[item.json.category] || labelMap[\"Other\"]\n  }\n}));"
+      },
+      "id": "124aa054-143a-4060-8ff7-5b88edc2ffe2",
+      "name": "Map Category to Gmail Label ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3520,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.messageId }}",
+        "labelIds": "={{ [$json.gmailLabelId] }}"
+      },
+      "id": "094b3e95-07e5-4e01-84f8-8cbfb4054c5e",
+      "name": "Gmail - Apply Category Label",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        3728,
+        464
+      ],
+      "notes": "Uses gmailLabelId set by the mapping node above."
+    },
+    {
+      "parameters": {
+        "jsCode": "const NEEDS_REVIEW_LABEL_ID = \"YOUR_LABEL_ID_NEEDS_REVIEW\";\nconst labelMap = {\n  \"Sales\": \"YOUR_LABEL_ID_SALES\",\n  \"Support\": \"YOUR_LABEL_ID_SUPPORT\",\n  \"Billing\": \"YOUR_LABEL_ID_BILLING\",\n  \"Technical\": \"YOUR_LABEL_ID_TECHNICAL\",\n  \"Internal\": \"YOUR_LABEL_ID_INTERNAL\",\n  \"Partnership\": \"YOUR_LABEL_ID_PARTNERSHIP\",\n  \"Spam\": \"SPAM\",\n  \"Newsletter\": \"YOUR_LABEL_ID_NEWSLETTER\",\n  \"Other\": \"YOUR_LABEL_ID_OTHER\"\n};\nreturn items.map(item => {\n  const catLabel = labelMap[item.json.category] || labelMap[\"Other\"];\n  return { json: { ...item.json, gmailLabelIds: [NEEDS_REVIEW_LABEL_ID, catLabel] } };\n});"
+      },
+      "id": "896fe4db-8a7a-43ff-9c5b-cdee337e6801",
+      "name": "Map Needs Review to Gmail Label ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3520,
+        704
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.messageId }}",
+        "labelIds": "={{ $json.gmailLabelIds }}"
+      },
+      "id": "22f77987-3c43-419b-beb7-66456a28883b",
+      "name": "Gmail - Apply Needs Review Label",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        3728,
+        704
+      ],
+      "notes": "Uses gmailLabelId set by the mapping node above."
+    },
+    {
+      "parameters": {
+        "select": "user",
+        "user": {
+          "__rl": true,
+          "value": "YOUR_SLACK_USERNAME",
+          "mode": "username"
+        },
+        "text": "=:rotating_light: *IMPORTANT EMAIL - needs your attention*\n*From:* {{ $('Map Needs Review to Gmail Label ID').item.json.sender }}\n*Subject:* {{ $('Map Needs Review to Gmail Label ID').item.json.subject }}\n*Found in:* {{ $('Map Needs Review to Gmail Label ID').item.json.inSpam ? ':warning: SPAM folder - Gmail wrongly filtered this as spam' : 'Inbox' }}\n*Priority:* {{ $('Map Needs Review to Gmail Label ID').item.json.priority }}  |  *Category:* {{ $('Map Needs Review to Gmail Label ID').item.json.category }}  |  *Confidence:* {{ $('Map Needs Review to Gmail Label ID').item.json.confidence }}%\n*Summary:* {{ $('Map Needs Review to Gmail Label ID').item.json.summary }}\n*What it needs from you:* {{ $('Map Needs Review to Gmail Label ID').item.json.action_needed }}\n*Why flagged:* {{ $('Map Needs Review to Gmail Label ID').item.json.reasoning }}",
+        "otherOptions": {}
+      },
+      "id": "c01d701a-7ac2-487f-81a2-a6500408270c",
+      "name": "Slack - Needs Review Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        3952,
+        704
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "3b0f7979-9f25-4c33-8095-af3bbe2dda23",
+      "name": "Log Processing Result",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3952,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## AI Email Sorting, Notification & Analysis\n\n**Read-only sorting.** Never writes drafts, never sends, deletes or archives email. You write every reply yourself.\n\n1. Poll Gmail every minute for new unread mail in the Inbox AND Spam folder\n2. Validate + clean (body text extracted)\n3. Gemini reads the BODY (plus sender/subject) and classifies\n4. Promotions, order confirmations, auto-replies, job alerts -> labelled only (no Slack)\n5. Important (bank debit/credit alerts, order arrived, job/interview replies, legal, personal) or low-confidence -> Needs Review label + immediate Slack alert\n6. Every 3 hours: whole-day digest to Slack (bottom branch)\n\n**If the AI model fails:** the email is retried (3 tries, then again after 2 minutes). If it still fails, that email is left untouched (no label, no per-email Slack message) and ONE 'AI model issue' Slack notice is sent (max 1 per hour). The 3-hour digest analyses it later.",
+        "height": 332,
+        "width": 460
+      },
+      "id": "9ef1e9d9-120e-4d80-b68d-ce47a11d6b0e",
+      "name": "AI Email Triage - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1088,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = [];\nconst VALID_CATEGORIES = ['Sales','Support','Billing','Technical','Internal','Partnership','Spam','Newsletter','Other'];\nconst VALID_PRIORITIES = ['Low','Medium','High','Urgent'];\nconst CONFIDENCE_THRESHOLD = 80;\n\nfor (let i = 0; i < items.length; i++) {\n  const original = items[i].json;\n  const cleaned = $('Clean HTML & Extract Metadata').item.json;\n  let parsed = null;\n  let parseError = null;\n\n  try {\n    if (original.error) {\n      const em = typeof original.error === 'string' ? original.error : (original.error.message || JSON.stringify(original.error));\n      throw new Error('AI model error: ' + String(em).replace(/\\s+/g, ' ').slice(0, 160));\n    }\n\n    const content = original.output\n      ? (typeof original.output === 'string' ? original.output : JSON.stringify(original.output))\n      : null;\n\n    if (!content) {\n      throw new Error('No content returned from Gemini API');\n    }\n\n    const jsonMatch = content.match(/\\{[\\s\\S]*\\}/);\n    const jsonText = jsonMatch ? jsonMatch[0] : content;\n    parsed = JSON.parse(jsonText);\n\n    if (!VALID_CATEGORIES.includes(parsed.category)) {\n      parsed.category = 'Other';\n    }\n    if (!VALID_PRIORITIES.includes(parsed.priority)) {\n      parsed.priority = 'Low';\n    }\n    parsed.confidence = Math.max(0, Math.min(100, parseInt(parsed.confidence, 10) || 0));\n    parsed.summary = parsed.summary || '';\n    parsed.action_needed = parsed.action_needed || '';\n    parsed.reasoning = parsed.reasoning || '';\n\n    parsed.is_important = !!parsed.is_important;\n    const isBulk = parsed.category === 'Spam' || parsed.category === 'Newsletter';\n    if (isBulk) {\n      // Spam / newsletters / generic promos: label only. Never review, never reply.\n      parsed.is_important = false;\n      parsed.needs_review = false;\n    } else {\n      // Only important (bank/serious/direct) or low-confidence non-bulk mail goes to review.\n      parsed.needs_review = parsed.is_important || parsed.confidence < CONFIDENCE_THRESHOLD;\n    }\n  } catch (err) {\n    parseError = err.message;\n    // AI failed: no labels, no Slack alert for this email. It is reported once (throttled) as an AI model issue.\n    parsed = {\n      summary: '', category: 'Other', priority: 'Low', confidence: 0,\n      needs_review: false, is_important: false, action_needed: '', reasoning: '',\n      aiFailed: true,\n      aiError: String(parseError || 'unknown error').replace(/\\s+/g, ' ').slice(0, 200)\n    };\n  }\n\n  results.push({\n    json: {\n      messageId: cleaned.messageId,\n      threadId: cleaned.threadId,\n      sender: cleaned.sender,\n      subject: cleaned.subject,\n      inSpam: !!cleaned.inSpam,\n      cleanedBody: cleaned.cleanedBody,\n      aiFailed: false,\n      ...parsed,\n      processingError: parseError\n    }\n  });\n}\nreturn results;"
+      },
+      "id": "146c8f71-9678-4fd1-86fa-481af5eaa650",
+      "name": "Parse & Validate Gemini Response1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2896,
+        592
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Sender: {{ $json.sender }}\nSubject: {{ $json.subject }}\nHas Attachments: {{ $json.hasAttachments }}\nList-Unsubscribe header present (weak hint only): {{ $json.hasUnsubscribeHeader }}\nAuto-submitted header (weak hint only): {{ $json.isAutoSubmitted }}\n\nBody:\n{{ $json.cleanedBody }}",
+        "options": {
+          "systemMessage": "You are an email sorting, notification and analysis assistant for one person's personal inbox. You never write replies: the human writes every reply himself. Your job is to read each email and decide whether it is important enough to notify him immediately.\n\nReturn ONLY valid JSON. Never include explanations, Markdown, or extra text before or after the JSON.\n\nSteps:\n1. Read the ENTIRE email. The body content is the main evidence. Sender, subject and headers are only weak hints and must never decide the result on their own. Banks, shops and job sites send both important and unimportant emails, so judge each email by what it actually says.\n2. Work out what the email is really about, what actually happened, and whether the recipient needs to know or do something now.\n3. Write a concise summary (1-2 sentences).\n4. Assign category: one of [Sales, Support, Billing, Technical, Internal, Partnership, Spam, Newsletter, Other]\n5. Assign priority: one of [Low, Medium, High, Urgent]\n6. Estimate confidence as an integer 0-100.\n7. Write action_needed: one short sentence saying what the recipient must do or check (for example: Reply to confirm the interview time; Money was debited - check it was you), or None - informational. Never write a reply or draft.\n8. NOT important (is_important false), judged from the body: promotions, discounts, ads, product recommendations, reward or gift blasts, newsletters; order confirmations, receipts and payment confirmations for an order he just placed; order processing or shipped-with-tracking updates (he already knows about the order); automated no-reply notices with nothing to act on, auto-replies, out-of-office; job-board alerts and job recommendations; verification codes. Use category Newsletter for these (Spam for unsolicited junk or scams).\n9. IMPORTANT (is_important true), judged from the body: (a) bank or fintech emails about his money: debit alerts, credit alerts, transfers, failed or declined payments, statements, card or account security alerts (a bank's promotional offer is NOT important - read the body); (b) delivery news that needs attention: the order has arrived or been delivered, out for delivery today, delivery failed, pickup required, a problem with an order or refund; (c) a real message about a job application, interview, job offer or a recruiter writing to him (NOT an automated job alert); (d) invoices, tax, legal, government, contracts, medical, deadlines; (e) a real person writing personally with content that matters. Never true for Spam or Newsletter.\n10. If confidence is below 80 and the email is not Spam/Newsletter, set needs_review to true and explain the limitation in reasoning.\n11. In reasoning, state what in the BODY made the email important or not.\n\nReturn exactly this JSON shape and nothing else:\n{\n  \"summary\": \"string\",\n  \"category\": \"Sales|Support|Billing|Technical|Internal|Partnership|Spam|Newsletter|Other\",\n  \"priority\": \"Low|Medium|High|Urgent\",\n  \"is_important\": false,\n  \"confidence\": 0,\n  \"action_needed\": \"string\",\n  \"needs_review\": false,\n  \"reasoning\": \"string\"\n}"
+        }
+      },
+      "id": "f25cc715-c330-476a-814c-53c9511ad22c",
+      "name": "AI Agent - Analyze Email1",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1968,
+        592
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "maxOutputTokens": 8192,
+          "temperature": 0.1
+        }
+      },
+      "id": "b12dc7be-717d-49bf-a5a3-c032b6d4f152",
+      "name": "Gemini Chat Model - Analyze Email1",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2304,
+        784
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.userPrompt }}",
+        "options": {
+          "systemMessage": "={{ $json.systemPrompt }}"
+        }
+      },
+      "id": "0d778716-6f7b-46c3-8abe-0aea4f9fe0b7",
+      "name": "AI Agent - Daily Digest1",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1984,
+        1376
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "maxOutputTokens": 32000,
+          "temperature": 0.1
+        }
+      },
+      "id": "2aeb4d94-b124-49b1-bf03-03b2bcb1c20c",
+      "name": "Gemini Chat Model - Daily Digest1",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1984,
+        1616
+      ]
+    }
+  ],
+  "connections": {
+    "IF Needs Review (Important)": {
+      "main": [
+        [
+          {
+            "node": "Map Needs Review to Gmail Label ID",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Map Category to Gmail Label ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 3 Hours - Digest Trigger": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Get Today's Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Get Today's Emails": {
+      "main": [
+        [
+          {
+            "node": "Build Digest Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest Prompt": {
+      "main": [
+        [
+          {
+            "node": "IF Has Emails Today",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Has Emails Today": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Daily Digest1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Digest": {
+      "main": [
+        [
+          {
+            "node": "Slack - Inbox Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF AI Failed (1st attempt)": {
+      "main": [
+        [
+          {
+            "node": "Wait 2 Min Before Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Parse & Validate Gemini Response1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 2 Min Before Retry": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Retry Analyze Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Retry Analyze Email": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate Gemini Response1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF AI Failed (final)": {
+      "main": [
+        [
+          {
+            "node": "Throttle AI Issue Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF Needs Review (Important)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Throttle AI Issue Alert": {
+      "main": [
+        [
+          {
+            "node": "Slack - AI Model Issue Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Trigger - New Email": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "IF Valid Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Valid Email": {
+      "main": [
+        [
+          {
+            "node": "Clean HTML & Extract Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip Invalid Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean HTML & Extract Metadata": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Analyze Email1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Category to Gmail Label ID": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Apply Category Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Apply Category Label": {
+      "main": [
+        [
+          {
+            "node": "Log Processing Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Needs Review to Gmail Label ID": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Apply Needs Review Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Apply Needs Review Label": {
+      "main": [
+        [
+          {
+            "node": "Slack - Needs Review Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate Gemini Response1": {
+      "main": [
+        [
+          {
+            "node": "IF AI Failed (final)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Analyze Email1": {
+      "main": [
+        [
+          {
+            "node": "IF AI Failed (1st attempt)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Chat Model - Analyze Email1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent - Analyze Email1",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "AI Agent - Retry Analyze Email",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Daily Digest1": {
+      "main": [
+        [
+          {
+            "node": "Format Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Chat Model - Daily Digest1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent - Daily Digest1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  }
+}
